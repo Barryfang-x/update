@@ -13,8 +13,10 @@ jobs:
           sudo apt-get install -y jq git
 
       - name: Ensure PERSONAL_TOKEN is set
+        env:
+          TOKEN: ${{ secrets.PERSONAL_TOKEN }}
         run: |
-          if [ -z "${{ secrets.PERSONAL_TOKEN }}" ]; then
+          if [ -z "$TOKEN" ]; then
             echo "Error: Please add a repository secret named PERSONAL_TOKEN with a PAT that has repo scope." >&2
             exit 1
           fi
@@ -25,16 +27,37 @@ jobs:
           TOKEN: ${{ secrets.PERSONAL_TOKEN }}
         run: |
           set -euo pipefail
+          api_get() {
+            local response status body
+            response=$(curl --silent --show-error --connect-timeout 15 --max-time 120 \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --write-out $'\n%{http_code}' "https://api.github.com$1") || return 1
+            status=${response##*$'\n'}
+            body=${response%$'\n'*}
+            if [[ "$status" != 2?? ]]; then
+              echo "::error::GitHub API HTTP $status on $1" >&2
+              printf '%s' "$body" | jq -r '.message // "No GitHub error message"' >&2 || true
+              echo "Check PERSONAL_TOKEN validity, expiry, repository access and permissions. Classic PAT needs repo and workflow; fine-grained PAT needs Contents and Workflows write access to target forks." >&2
+              return 1
+            fi
+            printf '%s' "$body"
+          }
           echo "Listing repositories for $GITHUB_USER..."
           page=1
           repos=()
           while :; do
-            resp=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/users/$GITHUB_USER/repos?per_page=100&page=$page")
-            names=$(echo "$resp" | jq -r '.[] | select(.fork == true) | .name')
-            if [ -z "$names" ]; then
-              break
+            resp=$(api_get "/user/repos?affiliation=owner&per_page=100&page=$page")
+            if ! jq -e 'type == "array"' <<< "$resp" >/dev/null; then
+              echo "::error::Repository API returned an unexpected response type" >&2
+              exit 1
             fi
-            while read -r n; do repos+=("$n"); done <<< "$names"
+            if [ "$(jq length <<< "$resp")" -eq 0 ]; then break; fi
+            names=$(echo "$resp" | jq -r '.[] | select(.fork == true) | .name')
+            if [ -n "$names" ]; then
+              while IFS= read -r n; do repos+=("$n"); done <<< "$names"
+            fi
             page=$((page+1))
           done
 
@@ -47,7 +70,7 @@ jobs:
 
           for repo in "${repos[@]}"; do
             echo "--- Processing $repo ---"
-            repo_meta=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/$GITHUB_USER/$repo")
+            repo_meta=$(api_get "/repos/$GITHUB_USER/$repo")
             parent_full=$(echo "$repo_meta" | jq -r '.parent.full_name // empty')
             parent_default_branch=$(echo "$repo_meta" | jq -r '.parent.default_branch // "main"')
             fork_default_branch=$(echo "$repo_meta" | jq -r '.default_branch // "main"')
@@ -62,6 +85,8 @@ jobs:
             git clone "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$repo.git"
             cd "$repo"
             git checkout "$fork_default_branch" || git checkout -b "$fork_default_branch"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             mkdir -p .github/workflows
 
             cat > .github/workflows/sync-upstream.yml <<EOF
@@ -101,16 +126,18 @@ jobs:
           
                 - name: Merge upstream changes
                   run: |
-                    git merge upstream/${parent_default_branch} --no-edit || echo "Merge failed or no changes"
+                    git merge upstream/${parent_default_branch} --no-edit
           
                 - name: Push changes back to fork
                   run: |
-                    git push origin ${fork_default_branch} || echo "Push failed or no changes"
+                    git push origin ${fork_default_branch}
           EOF
 
             git add .github/workflows/sync-upstream.yml
-            git commit -m "Add sync-upstream workflow (automatically added by central sync)" || echo "No changes to commit"
-            git push origin "$fork_default_branch" || echo "Push may have failed for $repo"
+            if ! git diff --cached --quiet; then
+              git commit -m "Add sync-upstream workflow (automatically added by central sync)"
+            fi
+            git push origin "$fork_default_branch"
             cd ..
             rm -rf "$repo"
           done
