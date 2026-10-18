@@ -1,0 +1,118 @@
+name: Sync all my forks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync-all-forks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git
+
+      - name: Ensure PERSONAL_TOKEN is set
+        run: |
+          if [ -z "${{ secrets.PERSONAL_TOKEN }}" ]; then
+            echo "Error: Please add a repository secret named PERSONAL_TOKEN with a PAT that has repo scope." >&2
+            exit 1
+          fi
+
+      - name: List forks and add workflow to each
+        env:
+          GITHUB_USER: Barryfang-x
+          TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Listing repositories for $GITHUB_USER..."
+          page=1
+          repos=()
+          while :; do
+            resp=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/users/$GITHUB_USER/repos?per_page=100&page=$page")
+            names=$(echo "$resp" | jq -r '.[] | select(.fork == true) | .name')
+            if [ -z "$names" ]; then
+              break
+            fi
+            while read -r n; do repos+=("$n"); done <<< "$names"
+            page=$((page+1))
+          done
+
+          if [ ${#repos[@]} -eq 0 ]; then
+            echo "No forked repositories found for $GITHUB_USER"
+            exit 0
+          fi
+
+          echo "Found ${#repos[@]} forks: ${repos[*]}"
+
+          for repo in "${repos[@]}"; do
+            echo "--- Processing $repo ---"
+            repo_meta=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/$GITHUB_USER/$repo")
+            parent_full=$(echo "$repo_meta" | jq -r '.parent.full_name // empty')
+            parent_default_branch=$(echo "$repo_meta" | jq -r '.parent.default_branch // "main"')
+            fork_default_branch=$(echo "$repo_meta" | jq -r '.default_branch // "main"')
+
+            if [ -z "$parent_full" ]; then
+              echo "Skipping $repo: no parent info found (not a fork?)"
+              continue
+            fi
+
+            echo "Parent: $parent_full, parent default branch: $parent_default_branch, fork default branch: $fork_default_branch"
+
+            git clone "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$repo.git"
+            cd "$repo"
+            git checkout "$fork_default_branch" || git checkout -b "$fork_default_branch"
+            mkdir -p .github/workflows
+
+            cat > .github/workflows/sync-upstream.yml <<EOF
+          name: Sync fork from upstream
+          
+          permissions:
+            contents: write
+          
+          on:
+            schedule:
+              - cron: '0 0 * * *'
+            workflow_dispatch:
+          
+          jobs:
+            sync:
+              runs-on: ubuntu-latest
+              steps:
+                - name: Checkout the repository
+                  uses: actions/checkout@v4
+                  with:
+                    fetch-depth: 0
+                    persist-credentials: true
+          
+                - name: Set git user
+                  run: |
+                    git config user.name "github-actions[bot]"
+                    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+                - name: Add upstream and fetch
+                  run: |
+                    git remote add upstream https://github.com/${parent_full}.git || true
+                    git fetch upstream
+          
+                - name: Checkout default branch
+                  run: |
+                    git checkout ${fork_default_branch}
+          
+                - name: Merge upstream changes
+                  run: |
+                    git merge upstream/${parent_default_branch} --no-edit || echo "Merge failed or no changes"
+          
+                - name: Push changes back to fork
+                  run: |
+                    git push origin ${fork_default_branch} || echo "Push failed or no changes"
+          EOF
+
+            git add .github/workflows/sync-upstream.yml
+            git commit -m "Add sync-upstream workflow (automatically added by central sync)" || echo "No changes to commit"
+            git push origin "$fork_default_branch" || echo "Push may have failed for $repo"
+            cd ..
+            rm -rf "$repo"
+          done
+
+          echo "All done. Workflows have been added/updated in your forks (where possible)."
